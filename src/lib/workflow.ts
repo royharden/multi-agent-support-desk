@@ -91,8 +91,6 @@ export async function processTicket(
       department: decision.route,
       ticket,
       mock: mockAgents,
-      supabase_url: import.meta.env.VITE_SUPABASE_URL,
-      supabase_key: import.meta.env.VITE_SUPABASE_ANON_KEY,
     });
 
     const needsReview =

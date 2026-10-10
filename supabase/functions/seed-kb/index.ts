@@ -2,10 +2,13 @@
 # Multi-Agent Support Desk — seed-kb edge function
 
 Embeds the 12 seed KB articles with text-embedding-3-small and upserts them
-into kb_articles. In mock mode (or when no OPENAI_API_KEY), falls back to
-keyword search — no embeddings stored, retrieval still works.
+into kb_articles. Uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from env.
+In mock mode (or when no OPENAI_API_KEY), falls back to keyword search.
+Checks the daily call cap before calling OpenAI. Fails closed (503) if the cap
+is exceeded or the cap check itself errors. Skips articles that already have
+embeddings (live mode bulk seed only).
 
-POST { mock?: boolean, supabase_url, supabase_key }
+POST { mock?: boolean, article_id?: string }
 -> { seeded: number, mode: "live" | "mock" }
 */
 const corsHeaders = {
@@ -13,6 +16,9 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+const DEFAULT_DAILY_LIMIT = 200;
+const FN_NAME = "seed-kb";
 
 interface SeedArticle {
   department: "billing" | "technical" | "account";
@@ -86,11 +92,26 @@ export const SEED_ARTICLES: SeedArticle[] = [
   },
 ];
 
-function encodeText(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  bytes.forEach((b) => (binary += String.fromCharCode(b)));
-  return btoa(binary);
+function failClosed(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: message }),
+    { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+  );
+}
+
+async function checkCap(): Promise<{ allowed: boolean; calls: number; limit: number }> {
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? String(DEFAULT_DAILY_LIMIT), 10);
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY for cap check");
+  }
+  const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
+  const admin = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
+  const { data, error } = await admin.rpc("increment_usage_counter", { p_fn: FN_NAME });
+  if (error) throw new Error(`cap check failed: ${error.message}`);
+  const calls = typeof data === "number" ? data : 0;
+  return { allowed: calls <= limit, calls, limit };
 }
 
 Deno.serve(async (req: Request) => {
@@ -106,10 +127,13 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const { mock, supabase_url, supabase_key, article_id } = await req.json();
-    if (!supabase_url || !supabase_key) {
-      return new Response(JSON.stringify({ error: "supabase_url and supabase_key are required" }), {
-        status: 400,
+    const { mock, article_id } = await req.json();
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) {
+      return new Response(JSON.stringify({ error: "server missing Supabase credentials" }), {
+        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
@@ -118,43 +142,32 @@ Deno.serve(async (req: Request) => {
     const mode = mock === true || !openAiKey ? "mock" : "live";
 
     const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
-    const supabase = createClient(supabase_url, supabase_key, {
+    const supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false },
     });
 
     let seeded = 0;
 
-    const upsertArticle = async (article: SeedArticle, embedding?: number[]) => {
-      const { data: existing } = await supabase
-        .from("kb_articles")
-        .select("id")
-        .eq("title", article.title)
-        .eq("department", article.department)
-        .maybeSingle();
-
-      if (existing) {
-        const { error } = await supabase
-          .from("kb_articles")
-          .update(embedding ? { body: article.body, embedding } : { body: article.body })
-          .eq("id", existing.id);
-        if (error) throw new Error(error.message);
-      } else {
-        const { error } = await supabase.from("kb_articles").insert({
-          department: article.department,
-          title: article.title,
-          body: article.body,
-          ...(embedding ? { embedding } : {}),
-        });
-        if (error) throw new Error(error.message);
-      }
-      seeded++;
-    };
-
     if (mode === "live") {
+      // Cap check before calling OpenAI — fail closed on error.
+      let cap;
+      try {
+        cap = await checkCap();
+      } catch (capErr) {
+        return failClosed(
+          `daily call cap check failed: ${capErr instanceof Error ? capErr.message : "unknown error"}`
+        );
+      }
+      if (!cap.allowed) {
+        return failClosed(
+          `daily call limit reached for ${FN_NAME} (${cap.calls}/${cap.limit})`
+        );
+      }
+
       if (article_id) {
         const { data: row } = await supabase
           .from("kb_articles")
-          .select("id, department, title, body")
+          .select("id, department, title, body, embedding")
           .eq("id", article_id)
           .maybeSingle();
         if (!row) throw new Error("article not found");
@@ -175,7 +188,34 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      const input = SEED_ARTICLES.map((a) => `${a.title}\n${a.body}`);
+      // Bulk seed: skip articles that already have embeddings.
+      const { data: existingRows } = await supabase
+        .from("kb_articles")
+        .select("id, title, department, embedding");
+
+      const existingMap = new Map<string, boolean>();
+      for (const row of existingRows ?? []) {
+        existingMap.set(`${row.department}|${row.title}`, row.embedding !== null);
+      }
+
+      const toEmbed: { article: SeedArticle; index: number }[] = [];
+      for (let i = 0; i < SEED_ARTICLES.length; i++) {
+        const a = SEED_ARTICLES[i];
+        const key = `${a.department}|${a.title}`;
+        const alreadyEmbedded = existingMap.get(key);
+        if (alreadyEmbedded === true) {
+          continue;
+        }
+        toEmbed.push({ article: a, index: i });
+      }
+
+      if (toEmbed.length === 0) {
+        return new Response(JSON.stringify({ seeded: 0, mode, skipped: true }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const input = toEmbed.map(({ article }) => `${article.title}\n${article.body}`);
       const res = await fetch("https://api.openai.com/v1/embeddings", {
         method: "POST",
         headers: { Authorization: `Bearer ${openAiKey}`, "Content-Type": "application/json" },
@@ -184,21 +224,19 @@ Deno.serve(async (req: Request) => {
       if (!res.ok) throw new Error(`OpenAI embeddings HTTP ${res.status}`);
       const json = await res.json();
 
-      for (let i = 0; i < SEED_ARTICLES.length; i++) {
-        const article = SEED_ARTICLES[i];
+      for (let i = 0; i < toEmbed.length; i++) {
+        const article = toEmbed[i].article;
         const embedding = json.data[i]?.embedding;
-        const { data: existing } = await supabase
-          .from("kb_articles")
-          .select("id, title, department")
-          .eq("title", article.title)
-          .eq("department", article.department)
-          .maybeSingle();
+        const key = `${article.department}|${article.title}`;
+        const existingRow = (existingRows ?? []).find(
+          (r) => r.department === article.department && r.title === article.title
+        );
 
-        if (existing) {
+        if (existingRow) {
           const { error } = await supabase
             .from("kb_articles")
             .update({ body: article.body, embedding })
-            .eq("id", existing.id);
+            .eq("id", existingRow.id);
           if (error) throw new Error(error.message);
         } else {
           const { error } = await supabase.from("kb_articles").insert({
@@ -213,14 +251,34 @@ Deno.serve(async (req: Request) => {
       }
     } else {
       if (article_id) {
-        // Mock mode: nothing to embed; report success.
         return new Response(JSON.stringify({ seeded: 0, mode }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
-      // Mock mode: still upsert article text; keyword search works without embeddings.
+      // Mock mode: upsert article text without embeddings.
       for (const article of SEED_ARTICLES) {
-        await upsertArticle(article);
+        const { data: existing } = await supabase
+          .from("kb_articles")
+          .select("id")
+          .eq("title", article.title)
+          .eq("department", article.department)
+          .maybeSingle();
+
+        if (existing) {
+          const { error } = await supabase
+            .from("kb_articles")
+            .update({ body: article.body })
+            .eq("id", existing.id);
+          if (error) throw new Error(error.message);
+        } else {
+          const { error } = await supabase.from("kb_articles").insert({
+            department: article.department,
+            title: article.title,
+            body: article.body,
+          });
+          if (error) throw new Error(error.message);
+        }
+        seeded++;
       }
     }
 

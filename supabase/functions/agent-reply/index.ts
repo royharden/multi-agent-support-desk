@@ -8,6 +8,9 @@ Specialist LLM agent (Billing / Technical / Account) that:
 4. Returns { reply, cited_article_ids, self_confidence }
 
 Secrets: OPENAI_API_KEY, optional OPENAI_BASE_URL, OPENAI_MODEL.
+Uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from env (never from request body).
+Checks the daily call cap before calling OpenAI. Fails closed (503) if the cap
+is exceeded or the cap check itself errors.
 If no key, or mock=true, returns canned replies citing real KB ids.
 */
 const corsHeaders = {
@@ -15,6 +18,9 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+const DEFAULT_DAILY_LIMIT = 200;
+const FN_NAME = "agent-reply";
 
 interface KbArticle {
   id: string;
@@ -45,11 +51,26 @@ const SYSTEM_PROMPTS: Record<string, string> = {
     "You are an Account Management specialist for Lumen Analytics, a fictional SaaS. Draft a short, empathetic reply to the customer. ONLY use the provided knowledge base articles. Cite the article titles you used. Never perform account deletion or security changes yourself — point to the documented process. End with a clear next step.",
 };
 
-function encodeText(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  bytes.forEach((b) => (binary += String.fromCharCode(b)));
-  return btoa(binary);
+function failClosed(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: message }),
+    { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+  );
+}
+
+async function checkCap(): Promise<{ allowed: boolean; calls: number; limit: number }> {
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? String(DEFAULT_DAILY_LIMIT), 10);
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY for cap check");
+  }
+  const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
+  const admin = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
+  const { data, error } = await admin.rpc("increment_usage_counter", { p_fn: FN_NAME });
+  if (error) throw new Error(`cap check failed: ${error.message}`);
+  const calls = typeof data === "number" ? data : 0;
+  return { allowed: calls <= limit, calls, limit };
 }
 
 async function embed(text: string, apiKey: string, baseUrl: string): Promise<number[] | null> {
@@ -67,20 +88,13 @@ async function embed(text: string, apiKey: string, baseUrl: string): Promise<num
   }
 }
 
-interface SupabaseClient {
-  from(table: string): {
-    select(cols: string): {
-      eq(col: string, val: unknown): PromiseLike<{ data: KbArticle[] | null; error: { message: string } | null }>;
-    };
-  };
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+type SupaClient = ReturnType<Awaited<ReturnType<typeof import("npm:@supabase/supabase-js@2.57.4")>["createClient"]>>;
 
 async function vectorSearch(
-  supabase: SupabaseClient,
+  supabase: SupaClient,
   department: string,
-  ticketEmbedding: number[],
-  apiKey: string,
-  baseUrl: string
+  ticketEmbedding: number[]
 ): Promise<KbArticle[]> {
   const embeddingStr = `[${ticketEmbedding.join(",")}]`;
   const { data, error } = await supabase.rpc("match_kb_articles", {
@@ -91,20 +105,20 @@ async function vectorSearch(
   if (error || !data) {
     console.error("vector search failed, falling back to all dept articles:", error?.message);
     const all = await supabase.from("kb_articles").select("id, department, title, body");
-    return (all.data ?? []).filter((a) => a.department === department).slice(0, 3);
+    return (all.data ?? []).filter((a: KbArticle) => a.department === department).slice(0, 3);
   }
   return data as unknown as KbArticle[];
 }
 
 async function keywordSearch(
-  supabase: SupabaseClient,
+  supabase: SupaClient,
   department: string,
   ticketText: string
 ): Promise<{ id: string; title: string; body: string; score: number }[]> {
   const { data } = await supabase.from("kb_articles").select("id, department, title, body");
-  const articles = (data ?? []).filter((a) => a.department === department);
+  const articles = (data ?? []).filter((a: KbArticle) => a.department === department);
   const words = ticketText.toLowerCase().split(/\W+/).filter((w) => w.length > 3);
-  const scored = articles.map((a) => {
+  const scored = articles.map((a: KbArticle) => {
     const hay = (a.title + " " + a.body).toLowerCase();
     let score = 0;
     for (const w of words) if (hay.includes(w)) score++;
@@ -198,7 +212,7 @@ ${primary ? `In short: ${primary.title}.` : ""}${secondary ? ` This is covered i
 A member of our team will confirm this resolves your question. If anything in the above doesn't match what you're seeing, just reply and we'll pick it up from there.
 
 Best,
-Lumen Analytics ${DEPARTMENT_LABELS.technical ? "Support" : "Support"}`;
+Lumen Analytics Support`;
 
   return {
     reply,
@@ -222,13 +236,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const {
-      department,
-      ticket,
-      mock,
-      supabase_url,
-      supabase_key,
-    } = await req.json();
+    const { department, ticket, mock } = await req.json();
 
     if (!department || !ticket) {
       return new Response(JSON.stringify({ error: "department and ticket are required" }), {
@@ -241,35 +249,54 @@ Deno.serve(async (req: Request) => {
     const baseUrl = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
     const openAiModel = Deno.env.get("OPENAI_MODEL") ?? "gpt-4o-mini";
 
-    if (!supabase_url || !supabase_key) {
-      return new Response(JSON.stringify({ error: "supabase_url and supabase_key are required" }), {
-        status: 400,
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) {
+      return new Response(JSON.stringify({ error: "server missing Supabase credentials" }), {
+        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
-    const supabase = createClient(supabase_url, supabase_key, {
+    const supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false },
     });
 
     const ticketText = `${ticket.subject}\n${ticket.body}`;
-    let articles: { id: string; title: string; body: string }[] = [];
-    let usedMock = mock === true || !openAiKey;
+    let articles: KbArticle[] = [];
+    const usedMock = mock === true || !openAiKey;
+
+    // Only check the cap when we will actually call an external LLM API.
+    if (!usedMock) {
+      let cap;
+      try {
+        cap = await checkCap();
+      } catch (capErr) {
+        return failClosed(
+          `daily call cap check failed: ${capErr instanceof Error ? capErr.message : "unknown error"}`
+        );
+      }
+      if (!cap.allowed) {
+        return failClosed(
+          `daily call limit reached for ${FN_NAME} (${cap.calls}/${cap.limit})`
+        );
+      }
+    }
 
     if (!usedMock) {
       const embedding = await embed(ticketText, openAiKey!, baseUrl);
       if (embedding) {
-        articles = await vectorSearch(supabase as unknown as SupabaseClient, department, embedding, openAiKey!, baseUrl);
+        articles = await vectorSearch(supabase, department, embedding);
       }
       if (!articles || articles.length === 0) {
-        articles = await keywordSearch(supabase as unknown as SupabaseClient, department, ticketText);
+        articles = await keywordSearch(supabase, department, ticketText);
       }
     } else {
-      articles = await keywordSearch(supabase as unknown as SupabaseClient, department, ticketText);
+      articles = await keywordSearch(supabase, department, ticketText);
       if (articles.length === 0) {
         const all = await supabase.from("kb_articles").select("id, department, title, body");
-        articles = (all.data ?? []).filter((a) => a.department === department).slice(0, 3);
+        articles = (all.data ?? []).filter((a: KbArticle) => a.department === department).slice(0, 3);
       }
     }
 

@@ -28,8 +28,6 @@ export default function KbPage({ articles, onRefresh }: Props) {
       // Re-embed just the new article via seed-kb (mock-safe fallback included).
       await invokeFn<{ seeded: number; mode: string }>("seed-kb", {
         article_id: (inserted as { id: string }).id,
-        supabase_url: import.meta.env.VITE_SUPABASE_URL,
-        supabase_key: import.meta.env.VITE_SUPABASE_ANON_KEY,
       });
       setTitle("");
       setBody("");
@@ -46,10 +44,7 @@ export default function KbPage({ articles, onRefresh }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await invokeFn<{ seeded: number; mode: string }>("seed-kb", {
-        supabase_url: import.meta.env.VITE_SUPABASE_URL,
-        supabase_key: import.meta.env.VITE_SUPABASE_ANON_KEY,
-      });
+      await invokeFn<{ seeded: number; mode: string }>("seed-kb", {});
       onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "reseed failed");

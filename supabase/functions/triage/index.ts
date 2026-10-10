@@ -3,10 +3,14 @@
 
 Calls the TypeSafe System-1 model (Jev) with all 4 questions in ONE request.
 Secret: TYPESAFE_API_KEY. Returns { answers, model, usage, latency_ms, cost_usd }.
+Checks the daily call cap before calling TypeSafe. Fails closed (503) if the
+cap is exceeded or the cap check itself errors.
 */
 const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
 const MODEL = "jev-1.13.0";
 const COST_PER_TOKEN_USD = 0.042 / 1_000_000;
+const DEFAULT_DAILY_LIMIT = 200;
+const FN_NAME = "triage";
 
 interface TypeSafeQuestion {
   type: "choice" | "score" | "noul";
@@ -39,6 +43,21 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+async function checkCap(): Promise<{ allowed: boolean; calls: number; limit: number }> {
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? String(DEFAULT_DAILY_LIMIT), 10);
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY for cap check");
+  }
+  const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
+  const admin = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
+  const { data, error } = await admin.rpc("increment_usage_counter", { p_fn: FN_NAME });
+  if (error) throw new Error(`cap check failed: ${error.message}`);
+  const calls = typeof data === "number" ? data : 0;
+  return { allowed: calls <= limit, calls, limit };
+}
 
 async function callTypeSafe(body: unknown, apiKey: string): Promise<TypeSafeResponse> {
   let lastError = "";
@@ -155,6 +174,13 @@ function parseAnswers(raw: TypeSafeResponse) {
   };
 }
 
+function failClosed(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: message }),
+    { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+  );
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -182,6 +208,21 @@ Deno.serve(async (req: Request) => {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
+    }
+
+    // Cap check — fail closed if the check itself errors.
+    let cap;
+    try {
+      cap = await checkCap();
+    } catch (capErr) {
+      return failClosed(
+        `daily call cap check failed: ${capErr instanceof Error ? capErr.message : "unknown error"}`
+      );
+    }
+    if (!cap.allowed) {
+      return failClosed(
+        `daily call limit reached for ${FN_NAME} (${cap.calls}/${cap.limit})`
+      );
     }
 
     const jevRequest = buildRequest(
