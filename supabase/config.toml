@@ -1,0 +1,10 @@
+project_id = "multi-agent-support-desk"
+
+[functions.triage]
+verify_jwt = false
+
+[functions.agent-reply]
+verify_jwt = false
+
+[functions.seed-kb]
+verify_jwt = false
