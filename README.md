@@ -52,10 +52,18 @@ flowchart LR
 | `OPENAI_API_KEY` | Edge function secret | Embeddings + specialist agent chat completions |
 | `OPENAI_BASE_URL` | Edge function secret (optional) | OpenAI-compatible base URL (default `https://api.openai.com/v1`) |
 | `OPENAI_MODEL` | Edge function secret (optional) | Specialist agent model (default `gpt-4o-mini`) |
+| `DAILY_CALL_LIMIT` | Edge function secret (optional) | Daily cap per counter (default `200`): paid TypeSafe/OpenAI calls and database writes are each capped per function |
 | `VITE_SUPABASE_URL` | Frontend env | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Frontend env | Supabase anon key |
 
 See `.env.example` for the frontend variables.
+
+## Security model
+
+- **The browser is read-only.** The anon key can `SELECT` the four app tables and nothing else. Every write (creating tickets, triage results, agent drafts, human approve/reassign/resolve, adding KB articles) goes through the `triage`, `agent-reply` and `seed-kb` Edge Functions, which use the service-role key from their environment, whitelist columns and bound payload sizes.
+- **Functions require a JWT** (`verify_jwt = true`); the frontend calls them with `supabase.functions.invoke`, which sends the anon key.
+- **Daily cap, fail closed.** Every paid upstream fetch (each TypeSafe call, each embedding, each chat completion, including retries) and every write is counted in `usage_counters` through the service-role-only `increment_usage_counter` function. Over the cap returns `429 { "error": "daily_limit" }`; if the counter can't be read the function returns `503` and makes no paid call.
+- `usage_counters`, `increment_usage_counter` and `match_kb_articles` are not reachable with the anon key.
 
 ## Screenshots
 
@@ -74,6 +82,6 @@ See `.env.example` for the frontend variables.
 - **One fan-out, four questions.** All four Jev questions (department choice, frustration score, urgency, needs-human) are sent in a single request per ticket. That keeps triage latency and cost flat as the question list grows.
 - **Questions are atomic and literal.** Each question asks exactly one thing, refers to state fields by their backticked names, and puts every threshold in application code — the model classifies, the code decides.
 - **Jev triage always runs live**, even in "Mock agents" mode, so the demo always exercises the real System-1 path. Mock mode only swaps the specialist LLM replies for canned drafts that still cite real KB article ids.
-- **Routing is a pure function.** `route(answers, policy)` takes Jev's answers plus a policy object and returns the route, priority, and fired rules. It is unit-tested (`scripts/test-routing.ts`) and the policy used for every decision is stored with the triage row.
+- **Routing is a pure function.** `route(answers, policy)` takes Jev's answers plus a policy object and returns the route, priority, and fired rules. It is unit-tested (`scripts/test-routing.ts`) and the policy used for every decision is stored with the triage row. The `triage` Edge Function applies an identical copy server-side so the stored decision can't be forged by the browser; keep the two in sync.
 - **Defense in depth on replies.** A specialist draft only auto-sends if the agent's self-confidence clears the threshold and it cited at least one KB article; otherwise it goes to the human queue with the reason.
 - **Department colors are consistent everywhere** — Billing emerald, Technical sky, Account violet, Human amber — in the inbox, queue, architecture strip, and stats donut.

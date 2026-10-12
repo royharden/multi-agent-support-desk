@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { BookOpen, Plus, RefreshCw, Loader2 } from "lucide-react";
 import type { KbArticle } from "@/lib/supabase";
-import { supabase, DEPT_COLORS } from "@/lib/supabase";
-import { invokeFn } from "@/lib/workflow";
+import { DEPT_COLORS } from "@/lib/supabase";
+import { invokeFn, addKbArticle, LIMITS } from "@/lib/workflow";
 
 interface Props {
   articles: KbArticle[];
@@ -23,12 +23,9 @@ export default function KbPage({ articles, onRefresh }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const { data: inserted, error } = await supabase.from("kb_articles").insert({ department, title, body }).select("id").single();
-      if (error) throw new Error(error.message);
-      // Re-embed just the new article via seed-kb (mock-safe fallback included).
-      await invokeFn<{ seeded: number; mode: string }>("seed-kb", {
-        article_id: (inserted as { id: string }).id,
-      });
+      // seed-kb stores the article and embeds it (mock-safe fallback included).
+      const result = await addKbArticle({ department, title, body });
+      if (result.warning) setError(`Article saved without an embedding (${result.warning}).`);
       setTitle("");
       setBody("");
       setShowForm(false);
@@ -44,11 +41,12 @@ export default function KbPage({ articles, onRefresh }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await invokeFn<{ seeded: number; mode: string }>("seed-kb", {});
-      onRefresh();
+      await invokeFn<{ seeded: number; mode: string }>("seed-kb", { action: "seed" });
     } catch (err) {
       setError(err instanceof Error ? err.message : "reseed failed");
     } finally {
+      // Seeding saves article by article, so refresh even after a partial run.
+      onRefresh();
       setBusy(false);
     }
   };
@@ -92,6 +90,7 @@ export default function KbPage({ articles, onRefresh }: Props) {
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               placeholder="Title"
+              maxLength={LIMITS.kbTitle}
               className="flex-1 min-w-48 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500"
             />
           </div>
@@ -99,6 +98,7 @@ export default function KbPage({ articles, onRefresh }: Props) {
             value={body}
             onChange={(e) => setBody(e.target.value)}
             placeholder="Article body"
+            maxLength={LIMITS.kbBody}
             rows={5}
             className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500"
           />

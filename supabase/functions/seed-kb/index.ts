@@ -1,24 +1,45 @@
 /*
 # Multi-Agent Support Desk — seed-kb edge function
 
-Embeds the 12 seed KB articles with text-embedding-3-small and upserts them
-into kb_articles. Uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from env.
-In mock mode (or when no OPENAI_API_KEY), falls back to keyword search.
-Checks the daily call cap before calling OpenAI. Fails closed (503) if the cap
-is exceeded or the cap check itself errors. Skips articles that already have
-embeddings (live mode bulk seed only).
+Seeds the 12 starter KB articles and adds new articles from the KB page,
+embedding them with text-embedding-3-small when OPENAI_API_KEY is set.
+In mock mode (or when no OPENAI_API_KEY) articles are stored without embeddings
+and agents fall back to keyword search.
+Uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from env (never from the request).
 
-POST { mock?: boolean, article_id?: string }
--> { seeded: number, mode: "live" | "mock" }
+POST { action?: "seed", mock?: boolean }
+  -> { seeded, skipped, mode: "live" | "mock" }
+  Idempotent: only inserts missing starter articles and embeds starter articles
+  that have no embedding yet. Already-embedded articles are skipped.
+POST { action: "add_article", department, title, body, mock?: boolean }
+  -> { id, seeded, embedded, mode, warning? }
+
+One embeddings fetch per article. Every fetch (including retries) and every row
+written is counted against the daily cap (default 200/day, DAILY_CALL_LIMIT).
+The cap fails closed: an RPC error or a null/non-integer counter is a 503, over
+the cap is a 429 { error: "daily_limit" }.
 */
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const DEFAULT_DAILY_LIMIT = 200;
 const FN_NAME = "seed-kb";
+const PAID_COUNTER = FN_NAME; // one unit per embeddings fetch, retries included
+const WRITE_COUNTER = `${FN_NAME}:write`; // one unit per row written
+
+const DEFAULT_DAILY_LIMIT = 200;
+const MAX_UPSTREAM_ATTEMPTS = 2;
+const EMBEDDING_MODEL = "text-embedding-3-small";
+const EMBEDDING_TIMEOUT_MS = 20_000;
+const MAX_REQUEST_BYTES = 64 * 1024;
+const MAX_ARTICLES_PER_REQUEST = 12;
+const MAX_TITLE_CHARS = 200;
+const MAX_ARTICLE_BODY_CHARS = 8000;
+const KB_DEPARTMENTS = ["billing", "technical", "account"];
 
 interface SeedArticle {
   department: "billing" | "technical" | "account";
@@ -92,26 +113,320 @@ export const SEED_ARTICLES: SeedArticle[] = [
   },
 ];
 
-function failClosed(message: string): Response {
-  return new Response(
-    JSON.stringify({ error: message }),
-    { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-  );
+/* ---------- Shared helpers ---------- */
+
+class HttpError extends Error {
+  constructor(readonly status: number, readonly code: string) {
+    super(code);
+  }
 }
 
-async function checkCap(): Promise<{ allowed: boolean; calls: number; limit: number }> {
-  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? String(DEFAULT_DAILY_LIMIT), 10);
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error("missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY for cap check");
+function json(status: number, payload: unknown): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// Service-role client built only from env; null when either variable is missing.
+function adminClient(): SupabaseClient | null {
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+function dailyLimit(): number {
+  const raw = Deno.env.get("DAILY_CALL_LIMIT");
+  if (raw === undefined || raw.trim() === "") return DEFAULT_DAILY_LIMIT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    console.error("invalid DAILY_CALL_LIMIT, using default");
+    return DEFAULT_DAILY_LIMIT;
   }
-  const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
-  const admin = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
-  const { data, error } = await admin.rpc("increment_usage_counter", { p_fn: FN_NAME });
-  if (error) throw new Error(`cap check failed: ${error.message}`);
-  const calls = typeof data === "number" ? data : 0;
-  return { allowed: calls <= limit, calls, limit };
+  return n;
+}
+
+type CapResult = "ok" | "daily_limit" | "unavailable";
+
+// Atomically bumps today's counter and checks it against the limit. Fails
+// closed: an RPC error or a null/non-integer result is "unavailable".
+async function consumeCap(admin: SupabaseClient, counter: string): Promise<CapResult> {
+  try {
+    const { data, error } = await admin.rpc("increment_usage_counter", { p_fn: counter });
+    if (error) {
+      console.error(`cap check failed for ${counter}:`, error.message);
+      return "unavailable";
+    }
+    if (typeof data !== "number" || !Number.isInteger(data)) {
+      console.error(`cap check returned a non-integer for ${counter}:`, data);
+      return "unavailable";
+    }
+    return data <= dailyLimit() ? "ok" : "daily_limit";
+  } catch (err) {
+    console.error(`cap check threw for ${counter}:`, err);
+    return "unavailable";
+  }
+}
+
+function capFailure(result: Exclude<CapResult, "ok">): Response {
+  return result === "daily_limit"
+    ? json(429, { error: "daily_limit" })
+    : json(503, { error: "service_unavailable" });
+}
+
+async function readJsonBody(req: Request, maxBytes: number): Promise<unknown> {
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > maxBytes) throw new HttpError(413, "payload_too_large");
+  if (!req.body) throw new HttpError(400, "invalid_json");
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new HttpError(413, "payload_too_large");
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(buf));
+  } catch {
+    throw new HttpError(400, "invalid_json");
+  }
+}
+
+type UpstreamFailure = "daily_limit" | "unavailable" | "upstream_error";
+type UpstreamResult<T> = { ok: true; data: T; elapsedMs: number } | { ok: false; reason: UpstreamFailure };
+
+// Paid upstream call. The cap is consumed right before every attempt; retries
+// only on 429/529/network errors, at most MAX_UPSTREAM_ATTEMPTS, and never
+// after a daily_limit. Upstream error bodies are logged, never returned.
+async function paidFetchJson<T>(
+  admin: SupabaseClient,
+  counter: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<UpstreamResult<T>> {
+  let elapsedMs = 0;
+  for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt++) {
+    const cap = await consumeCap(admin, counter);
+    if (cap !== "ok") return { ok: false, reason: cap };
+
+    const startedAt = performance.now();
+    let res: Response;
+    try {
+      res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      elapsedMs += performance.now() - startedAt;
+      console.error(`${counter}: network error on attempt ${attempt}:`, err);
+      if (attempt < MAX_UPSTREAM_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      return { ok: false, reason: "upstream_error" };
+    }
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      elapsedMs += performance.now() - startedAt;
+      console.error(`${counter}: upstream HTTP ${res.status} on attempt ${attempt}: ${detail.slice(0, 500)}`);
+      if ((res.status === 429 || res.status === 529) && attempt < MAX_UPSTREAM_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      return { ok: false, reason: "upstream_error" };
+    }
+
+    try {
+      const data = (await res.json()) as T;
+      elapsedMs += performance.now() - startedAt;
+      return { ok: true, data, elapsedMs };
+    } catch (err) {
+      console.error(`${counter}: invalid JSON from upstream:`, err);
+      return { ok: false, reason: "upstream_error" };
+    }
+  }
+  return { ok: false, reason: "upstream_error" };
+}
+
+const FAILURE_STATUS: Record<UpstreamFailure, number> = {
+  daily_limit: 429,
+  unavailable: 503,
+  upstream_error: 502,
+};
+const FAILURE_CODE: Record<UpstreamFailure, string> = {
+  daily_limit: "daily_limit",
+  unavailable: "service_unavailable",
+  upstream_error: "upstream_error",
+};
+
+// Bulk seeding persists each article as it goes, so failures report progress.
+function seedFailure(reason: UpstreamFailure, seeded: number): Response {
+  return json(FAILURE_STATUS[reason], { error: FAILURE_CODE[reason], seeded });
+}
+
+/* ---------- Embeddings ---------- */
+
+function openAiBaseUrl(): string {
+  return Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
+}
+
+async function embedArticle(
+  admin: SupabaseClient,
+  apiKey: string,
+  title: string,
+  body: string
+): Promise<{ ok: true; embedding: number[] } | { ok: false; reason: UpstreamFailure }> {
+  const res = await paidFetchJson<{ data?: { embedding?: number[] }[] }>(
+    admin,
+    PAID_COUNTER,
+    `${openAiBaseUrl()}/embeddings`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: `${title}\n${body}` }),
+    },
+    EMBEDDING_TIMEOUT_MS
+  );
+  if (!res.ok) return res;
+  const embedding = res.data.data?.[0]?.embedding;
+  if (!Array.isArray(embedding) || embedding.length === 0) {
+    console.error("embeddings response contained no vector");
+    return { ok: false, reason: "upstream_error" };
+  }
+  return { ok: true, embedding };
+}
+
+/* ---------- Actions ---------- */
+
+async function seed(admin: SupabaseClient, input: Record<string, unknown>): Promise<Response> {
+  const apiKey = input.mock === true ? undefined : Deno.env.get("OPENAI_API_KEY");
+  const mode = apiKey ? "live" : "mock";
+
+  const articles = SEED_ARTICLES.slice(0, MAX_ARTICLES_PER_REQUEST).filter(
+    (a) => a.title.length <= MAX_TITLE_CHARS && a.body.length <= MAX_ARTICLE_BODY_CHARS
+  );
+  const titles = articles.map((a) => a.title);
+
+  const { data: rows, error: rowsErr } = await admin
+    .from("kb_articles")
+    .select("id, department, title")
+    .in("title", titles);
+  if (rowsErr) throw new Error(`kb lookup failed: ${rowsErr.message}`);
+
+  const { data: unembedded, error: unembeddedErr } = await admin
+    .from("kb_articles")
+    .select("id")
+    .in("title", titles)
+    .is("embedding", null);
+  if (unembeddedErr) throw new Error(`kb lookup failed: ${unembeddedErr.message}`);
+  const missingEmbedding = new Set((unembedded ?? []).map((r: { id: string }) => r.id));
+
+  let seeded = 0;
+  let skipped = 0;
+
+  for (const article of articles) {
+    const existing = (rows ?? []).find(
+      (r: { department: string; title: string }) =>
+        r.department === article.department && r.title === article.title
+    ) as { id: string } | undefined;
+
+    // Mock mode only fills in missing starter articles; live mode also embeds
+    // starter articles that have no embedding yet.
+    if (existing && (!apiKey || !missingEmbedding.has(existing.id))) {
+      skipped++;
+      continue;
+    }
+
+    const writeCap = await consumeCap(admin, WRITE_COUNTER);
+    if (writeCap !== "ok") return seedFailure(writeCap, seeded);
+
+    let embedding: number[] | null = null;
+    if (apiKey) {
+      const emb = await embedArticle(admin, apiKey, article.title, article.body);
+      if (!emb.ok) return seedFailure(emb.reason, seeded);
+      embedding = emb.embedding;
+    }
+
+    if (existing) {
+      const { error } = await admin
+        .from("kb_articles")
+        .update({ body: article.body, embedding })
+        .eq("id", existing.id);
+      if (error) throw new Error(`kb update failed: ${error.message}`);
+    } else {
+      const { error } = await admin.from("kb_articles").insert({
+        department: article.department,
+        title: article.title,
+        body: article.body,
+        embedding,
+      });
+      if (error) throw new Error(`kb insert failed: ${error.message}`);
+    }
+    seeded++;
+  }
+
+  return json(200, { seeded, skipped, mode });
+}
+
+async function addArticle(admin: SupabaseClient, input: Record<string, unknown>): Promise<Response> {
+  const { department, title, body } = input;
+  if (typeof department !== "string" || !KB_DEPARTMENTS.includes(department)) {
+    throw new HttpError(422, "invalid_department");
+  }
+  if (typeof title !== "string" || typeof body !== "string" || !title.trim() || !body.trim()) {
+    throw new HttpError(400, "title and body are required");
+  }
+  if (title.length > MAX_TITLE_CHARS || body.length > MAX_ARTICLE_BODY_CHARS) {
+    throw new HttpError(422, "article_too_long");
+  }
+
+  const writeCap = await consumeCap(admin, WRITE_COUNTER);
+  if (writeCap !== "ok") return capFailure(writeCap);
+
+  const apiKey = input.mock === true ? undefined : Deno.env.get("OPENAI_API_KEY");
+  const mode = apiKey ? "live" : "mock";
+
+  // If the embedding can't be made (cap reached, cap check failed, upstream
+  // error) the article is still saved without one, like in mock mode.
+  let embedding: number[] | null = null;
+  let warning: string | undefined;
+  if (apiKey) {
+    const emb = await embedArticle(admin, apiKey, title, body);
+    if (emb.ok) embedding = emb.embedding;
+    else warning = FAILURE_CODE[emb.reason];
+  }
+
+  const { data, error } = await admin
+    .from("kb_articles")
+    .insert({ department, title, body, embedding })
+    .select("id")
+    .single();
+  if (error) throw new Error(`kb insert failed: ${error.message}`);
+
+  return json(200, {
+    id: (data as { id: string }).id,
+    seeded: embedding ? 1 : 0,
+    embedded: embedding !== null,
+    mode,
+    ...(warning ? { warning } : {}),
+  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -120,175 +435,28 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    if (req.method !== "POST") {
-      return new Response(JSON.stringify({ error: "POST required" }), {
-        status: 405,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    if (req.method !== "POST") return json(405, { error: "POST required" });
+
+    const input = await readJsonBody(req, MAX_REQUEST_BYTES);
+    if (!isRecord(input)) throw new HttpError(400, "invalid_json");
+
+    const admin = adminClient();
+    if (!admin) {
+      console.error("missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+      return json(503, { error: "service_unavailable" });
     }
 
-    const { mock, article_id } = await req.json();
-
-    const supabaseUrl = Deno.env.get("SUPABASE_URL");
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    if (!supabaseUrl || !serviceRoleKey) {
-      return new Response(JSON.stringify({ error: "server missing Supabase credentials" }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    switch (input.action ?? "seed") {
+      case "seed":
+        return await seed(admin, input);
+      case "add_article":
+        return await addArticle(admin, input);
+      default:
+        throw new HttpError(400, "unknown_action");
     }
-
-    const openAiKey = Deno.env.get("OPENAI_API_KEY");
-    const mode = mock === true || !openAiKey ? "mock" : "live";
-
-    const { createClient } = await import("npm:@supabase/supabase-js@2.57.4");
-    const supabase = createClient(supabaseUrl, serviceRoleKey, {
-      auth: { persistSession: false },
-    });
-
-    let seeded = 0;
-
-    if (mode === "live") {
-      // Cap check before calling OpenAI — fail closed on error.
-      let cap;
-      try {
-        cap = await checkCap();
-      } catch (capErr) {
-        return failClosed(
-          `daily call cap check failed: ${capErr instanceof Error ? capErr.message : "unknown error"}`
-        );
-      }
-      if (!cap.allowed) {
-        return failClosed(
-          `daily call limit reached for ${FN_NAME} (${cap.calls}/${cap.limit})`
-        );
-      }
-
-      if (article_id) {
-        const { data: row } = await supabase
-          .from("kb_articles")
-          .select("id, department, title, body, embedding")
-          .eq("id", article_id)
-          .maybeSingle();
-        if (!row) throw new Error("article not found");
-        const res = await fetch("https://api.openai.com/v1/embeddings", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${openAiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ model: "text-embedding-3-small", input: `${row.title}\n${row.body}` }),
-        });
-        if (!res.ok) throw new Error(`OpenAI embeddings HTTP ${res.status}`);
-        const json = await res.json();
-        const { error } = await supabase
-          .from("kb_articles")
-          .update({ embedding: json.data[0].embedding })
-          .eq("id", row.id);
-        if (error) throw new Error(error.message);
-        return new Response(JSON.stringify({ seeded: 1, mode }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      // Bulk seed: skip articles that already have embeddings.
-      const { data: existingRows } = await supabase
-        .from("kb_articles")
-        .select("id, title, department, embedding");
-
-      const existingMap = new Map<string, boolean>();
-      for (const row of existingRows ?? []) {
-        existingMap.set(`${row.department}|${row.title}`, row.embedding !== null);
-      }
-
-      const toEmbed: { article: SeedArticle; index: number }[] = [];
-      for (let i = 0; i < SEED_ARTICLES.length; i++) {
-        const a = SEED_ARTICLES[i];
-        const key = `${a.department}|${a.title}`;
-        const alreadyEmbedded = existingMap.get(key);
-        if (alreadyEmbedded === true) {
-          continue;
-        }
-        toEmbed.push({ article: a, index: i });
-      }
-
-      if (toEmbed.length === 0) {
-        return new Response(JSON.stringify({ seeded: 0, mode, skipped: true }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      const input = toEmbed.map(({ article }) => `${article.title}\n${article.body}`);
-      const res = await fetch("https://api.openai.com/v1/embeddings", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${openAiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "text-embedding-3-small", input }),
-      });
-      if (!res.ok) throw new Error(`OpenAI embeddings HTTP ${res.status}`);
-      const json = await res.json();
-
-      for (let i = 0; i < toEmbed.length; i++) {
-        const article = toEmbed[i].article;
-        const embedding = json.data[i]?.embedding;
-        const key = `${article.department}|${article.title}`;
-        const existingRow = (existingRows ?? []).find(
-          (r) => r.department === article.department && r.title === article.title
-        );
-
-        if (existingRow) {
-          const { error } = await supabase
-            .from("kb_articles")
-            .update({ body: article.body, embedding })
-            .eq("id", existingRow.id);
-          if (error) throw new Error(error.message);
-        } else {
-          const { error } = await supabase.from("kb_articles").insert({
-            department: article.department,
-            title: article.title,
-            body: article.body,
-            embedding,
-          });
-          if (error) throw new Error(error.message);
-        }
-        seeded++;
-      }
-    } else {
-      if (article_id) {
-        return new Response(JSON.stringify({ seeded: 0, mode }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      // Mock mode: upsert article text without embeddings.
-      for (const article of SEED_ARTICLES) {
-        const { data: existing } = await supabase
-          .from("kb_articles")
-          .select("id")
-          .eq("title", article.title)
-          .eq("department", article.department)
-          .maybeSingle();
-
-        if (existing) {
-          const { error } = await supabase
-            .from("kb_articles")
-            .update({ body: article.body })
-            .eq("id", existing.id);
-          if (error) throw new Error(error.message);
-        } else {
-          const { error } = await supabase.from("kb_articles").insert({
-            department: article.department,
-            title: article.title,
-            body: article.body,
-          });
-          if (error) throw new Error(error.message);
-        }
-        seeded++;
-      }
-    }
-
-    return new Response(JSON.stringify({ seeded, mode }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
   } catch (err) {
-    return new Response(
-      JSON.stringify({ error: err instanceof Error ? err.message : "seed-kb failed" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    if (err instanceof HttpError) return json(err.status, { error: err.code });
+    console.error("seed-kb failed:", err);
+    return json(500, { error: "internal_error" });
   }
 });

@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { Users, Send, Pencil, CheckCircle2, RotateCcw } from "lucide-react";
 import type { Ticket, Reply, KbArticle, Department, TriageRecord } from "@/lib/supabase";
-import { supabase, DEPT_COLORS, FRUSTRATION_EMOJI } from "@/lib/supabase";
+import { DEPT_COLORS, FRUSTRATION_EMOJI } from "@/lib/supabase";
+import { approveReply, reassignTicket, resolveTicket, LIMITS } from "@/lib/workflow";
 
 interface Props {
   tickets: Ticket[];
@@ -24,25 +25,15 @@ export default function HumanQueue({ tickets, selectedId, onSelect, triage, repl
     if (!text.trim()) return;
     setBusy(t.id);
     try {
-      if (replies[t.id]) {
-        await supabase.from("replies").update({ body: text, approved_by_human: true }).eq("id", replies[t.id].id);
-      } else {
-        await supabase.from("replies").insert({
-          ticket_id: t.id,
-          department: t.route ?? "billing",
-          body: text,
-          cited_article_ids: [],
-          self_confidence: 1,
-          approved_by_human: true,
-        });
-      }
-      await supabase.from("tickets").update({ status: "auto_replied" }).eq("id", t.id);
+      await approveReply(t.id, text);
       setEditing((e) => {
         const c = { ...e };
         delete c[t.id];
         return c;
       });
       onRefresh();
+    } catch (err) {
+      console.error("approve failed:", err);
     } finally {
       setBusy(null);
     }
@@ -51,8 +42,10 @@ export default function HumanQueue({ tickets, selectedId, onSelect, triage, repl
   const reassign = async (t: Ticket, dept: Department) => {
     setBusy(t.id);
     try {
-      await supabase.from("tickets").update({ route: dept, status: "open" }).eq("id", t.id);
+      await reassignTicket(t.id, dept);
       onRefresh();
+    } catch (err) {
+      console.error("reassign failed:", err);
     } finally {
       setBusy(null);
     }
@@ -61,8 +54,10 @@ export default function HumanQueue({ tickets, selectedId, onSelect, triage, repl
   const resolve = async (t: Ticket) => {
     setBusy(t.id);
     try {
-      await supabase.from("tickets").update({ status: "resolved" }).eq("id", t.id);
+      await resolveTicket(t.id);
       onRefresh();
+    } catch (err) {
+      console.error("resolve failed:", err);
     } finally {
       setBusy(null);
     }
@@ -114,6 +109,7 @@ export default function HumanQueue({ tickets, selectedId, onSelect, triage, repl
                   value={editing[t.id]}
                   onChange={(e) => setEditing((prev) => ({ ...prev, [t.id]: e.target.value }))}
                   rows={6}
+                  maxLength={LIMITS.reply}
                   placeholder="Write the reply to send…"
                   className="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-900 p-2 text-[11px] text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-sky-500/50"
                 />

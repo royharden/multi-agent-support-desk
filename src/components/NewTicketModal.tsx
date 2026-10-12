@@ -1,8 +1,6 @@
 import { useState } from "react";
 import { Loader2, X } from "lucide-react";
-import type { Ticket } from "@/lib/supabase";
-import { supabase } from "@/lib/supabase";
-import { processTicket } from "@/lib/workflow";
+import { processTicket, createTickets, LIMITS } from "@/lib/workflow";
 import { RoutingPolicy } from "@/lib/routing";
 
 interface Props {
@@ -25,13 +23,9 @@ export default function NewTicketModal({ onClose, onCreated, policy, mockAgents 
     setBusy(true);
     setError(null);
     try {
-      const { data, error } = await supabase
-        .from("tickets")
-        .insert({ subject, body, customer_tier: tier, prior_contacts_7d: prior })
-        .select()
-        .single();
-      if (error) throw new Error(error.message);
-      const ticket = data as unknown as Ticket;
+      const [ticket] = await createTickets([
+        { subject, body, customer_tier: tier, prior_contacts_7d: prior },
+      ]);
       await processTicket(ticket, policy, mockAgents);
       onCreated();
       onClose();
@@ -58,12 +52,14 @@ export default function NewTicketModal({ onClose, onCreated, policy, mockAgents 
           value={subject}
           onChange={(e) => setSubject(e.target.value)}
           placeholder="Subject"
+          maxLength={LIMITS.subject}
           className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500"
         />
         <textarea
           value={body}
           onChange={(e) => setBody(e.target.value)}
           placeholder="Customer message"
+          maxLength={LIMITS.ticketBody}
           rows={5}
           className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-500"
         />
@@ -80,8 +76,9 @@ export default function NewTicketModal({ onClose, onCreated, policy, mockAgents 
           <input
             type="number"
             min={0}
+            max={LIMITS.priorContacts}
             value={prior}
-            onChange={(e) => setPrior(parseInt(e.target.value) || 0)}
+            onChange={(e) => setPrior(Math.min(LIMITS.priorContacts, Math.max(0, parseInt(e.target.value) || 0)))}
             className="w-32 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200"
             title="Prior contacts in last 7 days"
           />

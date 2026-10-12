@@ -3,7 +3,7 @@ import { Loader2, Inbox, BarChart3, BookOpen, Users, AlertTriangle } from "lucid
 import { supabase, type Ticket, type TriageRecord, type Reply, type KbArticle } from "@/lib/supabase";
 import { DEFAULT_POLICY, type RoutingPolicy } from "@/lib/routing";
 import { DEMO_TICKETS } from "@/lib/demoTickets";
-import { processTicket, PRESETS } from "@/lib/workflow";
+import { processTicket, createTickets, PRESETS } from "@/lib/workflow";
 import Header from "@/components/Header";
 import ArchitectureStrip from "@/components/ArchitectureStrip";
 import TicketList from "@/components/TicketList";
@@ -80,11 +80,9 @@ export default function App() {
         customer_tier: t.customer_tier,
         prior_contacts_7d: t.prior_contacts_7d,
       }));
-      const { data, error } = await supabase.from("tickets").insert(inserts).select();
-      if (error) throw new Error(error.message);
-      let current = [...(data as Ticket[])];
+      const created = await createTickets(inserts);
 
-      for (const ticket of current) {
+      for (const ticket of created) {
         const result = await processTicket(ticket, policy, mockAgents);
         if (result.error) setError(result.error);
       }

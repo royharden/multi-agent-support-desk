@@ -1,10 +1,62 @@
-import { supabase, type Ticket, type TriageRecord, type Reply, type Department, type TicketStatus } from "./supabase";
-import { route, DEFAULT_POLICY, type RoutingPolicy, type Department as PolicyDepartment } from "./routing";
+import { FunctionsHttpError } from "@supabase/supabase-js";
+import { supabase, type Ticket, type TriageRecord, type Reply, type Department, type KbArticle } from "./supabase";
+import { DEFAULT_POLICY, type RoutingPolicy, type RoutingDecision } from "./routing";
+
+// Mirrors the bounds enforced by the Edge Functions.
+export const LIMITS = {
+  subject: 200,
+  ticketBody: 4000,
+  priorContacts: 1000,
+  reply: 8000,
+  kbTitle: 200,
+  kbBody: 8000,
+};
 
 export async function invokeFn<T>(name: string, body: Record<string, unknown>): Promise<T> {
   const { data, error } = await supabase.functions.invoke(name, { body });
-  if (error) throw new Error(error.message);
+  if (error) {
+    let message = error.message;
+    if (error instanceof FunctionsHttpError) {
+      try {
+        const payload = await error.context.json();
+        if (payload && typeof payload.error === "string") message = payload.error;
+      } catch {
+        // keep the generic message
+      }
+    }
+    throw new Error(message);
+  }
   return data as T;
+}
+
+export interface NewTicket {
+  subject: string;
+  body: string;
+  customer_tier: string;
+  prior_contacts_7d: number;
+}
+
+export async function createTickets(tickets: NewTicket[]): Promise<Ticket[]> {
+  const result = await invokeFn<{ tickets: Ticket[] }>("triage", { action: "create_tickets", tickets });
+  return result.tickets;
+}
+
+export async function approveReply(ticketId: string, body: string): Promise<void> {
+  await invokeFn("agent-reply", { action: "approve", ticket_id: ticketId, body });
+}
+
+export async function reassignTicket(ticketId: string, department: Department): Promise<void> {
+  await invokeFn("agent-reply", { action: "reassign", ticket_id: ticketId, department });
+}
+
+export async function resolveTicket(ticketId: string): Promise<void> {
+  await invokeFn("agent-reply", { action: "resolve", ticket_id: ticketId });
+}
+
+export async function addKbArticle(
+  article: Pick<KbArticle, "department" | "title" | "body">
+): Promise<{ id: string; embedded: boolean; mode: string; warning?: string }> {
+  return invokeFn("seed-kb", { action: "add_article", ...article });
 }
 
 export interface ProcessResult {
@@ -20,110 +72,43 @@ export async function processTicket(
   mockAgents: boolean
 ): Promise<ProcessResult> {
   try {
-    // 1. Jev triage (always live)
+    // 1. Jev triage (always live). The Edge Function routes the ticket with
+    // this policy and stores the ticket's route/priority and the triage record.
     const triageResult = await invokeFn<{
       answers: TriageRecord["jev_response"];
       model: string;
       usage: { input_tokens: number };
       latency_ms: number;
       cost_usd: number;
-    }>("triage", { ticket });
+      decision: RoutingDecision;
+      ticket: Ticket;
+      triage_record: TriageRecord;
+    }>("triage", { action: "triage", ticket_id: ticket.id, policy });
 
-    const answers = triageResult.answers;
-    const decision = route(
-      {
-        needs_human: answers.needs_human,
-        frustrationScore: answers.frustration.score,
-        department: answers.department.choice as PolicyDepartment,
-        departmentConfidence: answers.department.confidence,
-      },
-      policy
-    );
+    const triageRecord = triageResult.triage_record;
+    const updatedTicket = triageResult.ticket;
 
-    let status: Ticket["status"];
-    if (decision.route === "human") {
-      status = "escalated";
-    } else {
-      status = "open";
-    }
-
-    await supabase
-      .from("tickets")
-      .update({ route: decision.route, priority: decision.priority, status })
-      .eq("id", ticket.id);
-
-    const { data: triageRow, error: triageErr } = await supabase
-      .from("triage")
-      .insert({
-        ticket_id: ticket.id,
-        jev_request: { questions: Object.keys(triageResult.answers) },
-        jev_response: answers,
-        model: triageResult.model,
-        latency_ms: triageResult.latency_ms,
-        input_tokens: triageResult.usage.input_tokens,
-        cost_usd: triageResult.cost_usd,
-        fired_rules: decision.firedRules,
-        policy,
-      })
-      .select()
-      .single();
-    if (triageErr) throw new Error(triageErr.message);
-    const triageRecord = triageRow as unknown as TriageRecord;
-
-    const updatedTicket: Ticket = {
-      ...ticket,
-      route: decision.route as Department,
-      priority: decision.priority,
-      status,
-    };
-
-    if (decision.route === "human") {
+    if (triageResult.decision.route === "human") {
       return { ticket: updatedTicket, triageRecord, reply: null };
     }
 
-    // 2. Specialist agent reply
+    // 2. Specialist agent reply. The Edge Function applies the reply check
+    // (self-confidence and citations) and stores the draft and new status.
     const agentResult = await invokeFn<{
       reply: string;
       cited_article_ids: string[];
       self_confidence: number;
       used_mock?: boolean;
+      ticket: Ticket;
+      reply_record: Reply;
     }>("agent-reply", {
-      department: decision.route,
-      ticket,
+      action: "draft",
+      ticket_id: ticket.id,
       mock: mockAgents,
+      agent_min_confidence: policy.agentMinConfidence,
     });
 
-    const needsReview =
-      agentResult.self_confidence < policy.agentMinConfidence ||
-      agentResult.cited_article_ids.length === 0;
-
-    const replyStatus: TicketStatus = needsReview ? "escalated" : "auto_replied";
-    await supabase
-      .from("tickets")
-      .update({ status: replyStatus, route: needsReview ? "human" : decision.route })
-      .eq("id", ticket.id);
-
-    const { data: replyRow, error: replyErr } = await supabase
-      .from("replies")
-      .insert({
-        ticket_id: ticket.id,
-        department: decision.route,
-        body: agentResult.reply,
-        cited_article_ids: agentResult.cited_article_ids,
-        self_confidence: agentResult.self_confidence,
-        approved_by_human: false,
-      })
-      .select()
-      .single();
-    if (replyErr) throw new Error(replyErr.message);
-
-    const finalTicket: Ticket = {
-      ...updatedTicket,
-      status: replyStatus,
-      route: needsReview ? "human" : (decision.route as Department),
-    };
-
-    return { ticket: finalTicket, triageRecord, reply: replyRow as unknown as Reply };
+    return { ticket: agentResult.ticket, triageRecord, reply: agentResult.reply_record };
   } catch (err) {
     return {
       ticket,
